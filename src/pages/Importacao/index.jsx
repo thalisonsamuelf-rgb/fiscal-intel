@@ -138,80 +138,108 @@ function parseNotaFechamento(text) {
   }
 }
 
-// A NF de entrada é gerada pela planilha — não é um documento de input
+// A NF de entrada e o Cálculo por Item são GERADOS pela ferramenta — não são inputs
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PARSER — Cálculo por Item (XLSX)
-// Sheet "taxas": [MOEDA, TAXA, DATA]
-// Sheet "Itens":  header + 1 row per item
-//   col PRODUTO=3, NCM=10, FOB=13(BRL), FRETE=14(BRL), SEGURO=15(BRL), QTY=18
+// PARSER — Itens da DUIMP (extrai adições/itens do PDF da DUIMP desembaraçada)
+// Estratégia 1: split por marcador "ITEM N°/Nº"
+// Estratégia 2: âncoras por código de produto (M30-013)
 // ─────────────────────────────────────────────────────────────────────────────
-function parseCalcXlsx(arrayBuffer) {
-  const wb = XLSX.read(arrayBuffer)
+function parseDuimpItens(text) {
+  const n2 = s => parseFloat(String(s || '0').replace(/\./g, '').replace(',', '.')) || 0
+  const norm = text.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ')
+  let found = []
+
+  // Estratégia 1 — split por "ITEM N° 001"
+  const splits = norm.split(/ITEM\s+N[°º]?\s*\.?\s*0*(\d+)/i)
+  if (splits.length > 1) {
+    for (let i = 1; i < splits.length; i += 2) {
+      const seq = parseInt(splits[i]) || Math.ceil(i / 2)
+      const seg = splits[i + 1] || ''
+
+      const ncmM = seg.match(/\b(\d{4})[.\s]?(\d{2})[.\s]?(\d{2})[.\s]?(\d{2})\b/)
+      if (!ncmM) continue
+      const ncm = ncmM[1] + ncmM[2] + ncmM[3] + ncmM[4]
+
+      const prodM = seg.match(/\b([A-Z]\d{2,3}-\d{3,4})\b/) ||
+                    seg.match(/PRODUTO[:\s]+(\S+)/i)
+      const produto = prodM ? prodM[1] : `ITEM${String(seq).padStart(2, '0')}`
+
+      const qtyM = seg.match(/(\d+(?:[,.]\d+)?)\s*UN(?:IDADE)?/i) ||
+                   seg.match(/QTDE?[:\s]+(\d+)/i)
+      const qty = qtyM ? parseFloat(qtyM[1].replace(',', '.')) : 1
+
+      const fobM = seg.match(/\bFOB\b[^R\d]*R\$\s*([\d.,]+)/i) ||
+                   seg.match(/VLR\.?\s*FOB[^R\d]*([\d.,]+)/i)
+      const fobBRL = fobM ? n2(fobM[1]) : 0
+
+      const freteM = seg.match(/\bFRETE\b[^R\d]*R\$\s*([\d.,]+)/i) ||
+                     seg.match(/\bFRETE\b[^R\d]*([\d.,]+)\s*R\$/i)
+      const freteBRL = freteM ? n2(freteM[1]) : 0
+
+      const segM = seg.match(/\bSEGURO\b[^R\d]*R\$\s*([\d.,]+)/i) ||
+                   seg.match(/\bSEGURO\b[^R\d]*([\d.,]+)\s*R\$/i)
+      const seguroBRL = segM ? n2(segM[1]) : 0
+
+      if (ncm.length === 8 && (fobBRL > 0 || freteBRL > 0)) {
+        found.push({ seq, produto, descricao: produto, ncm, qty, fobBRL, freteBRL, seguroBRL, cifBRL: fobBRL + freteBRL + seguroBRL })
+      }
+    }
+  }
+
+  // Estratégia 2 — âncoras por SKU (M30-013, S30-023)
+  if (found.length === 0) {
+    const skuRe = /\b([A-Z]\d{2,3}-\d{3,4})\b/g
+    let m
+    while ((m = skuRe.exec(norm)) !== null) {
+      const seg = norm.slice(Math.max(0, m.index - 80), m.index + 500)
+      const ncmM = seg.match(/(\d{4})[.\s]?(\d{2})[.\s]?(\d{2})[.\s]?(\d{2})/)
+      if (!ncmM) continue
+      const ncm = ncmM[1] + ncmM[2] + ncmM[3] + ncmM[4]
+      const qtyM = seg.match(/(\d+)\s*UN(?:IDADE)?/i)
+      const fobM = seg.match(/FOB[^R\d]*R?\$?\s*([\d.,]{5,})/i)
+      const freteM = seg.match(/FRETE[^R\d]*R?\$?\s*([\d.,]{5,})/i)
+      const segM = seg.match(/SEGURO[^R\d]*R?\$?\s*([\d.,]+)/i)
+      const fobBRL = fobM ? n2(fobM[1]) : 0
+      if (fobBRL > 0) {
+        const freteBRL = freteM ? n2(freteM[1]) : 0
+        const seguroBRL = segM ? n2(segM[1]) : 0
+        found.push({
+          seq: found.length + 1, produto: m[1], descricao: m[1], ncm,
+          qty: qtyM ? parseFloat(qtyM[1]) : 1,
+          fobBRL, freteBRL, seguroBRL, cifBRL: fobBRL + freteBRL + seguroBRL,
+        })
+      }
+    }
+  }
+
+  return found
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PARSER — Invoice (fallback: extrai itens do PDF da Invoice/Fatura Comercial)
+// Retorna itens com SKU, qty e totalUSD para rateio proporcional
+// ─────────────────────────────────────────────────────────────────────────────
+function parseInvoice(text) {
   const items = []
-  let taxa = 0
-
-  const taxasSheet = wb.Sheets['taxas'] || wb.Sheets['Taxas'] || wb.Sheets['TAXAS']
-  if (taxasSheet) {
-    const td = XLSX.utils.sheet_to_json(taxasSheet, { header: 1, defval: null })
-    for (const row of td) {
-      if (row && String(row[0] || '').toUpperCase() === 'USD' && row[1]) {
-        taxa = parseFloat(row[1]) || 0; break
-      }
+  const toUSD = s => parseFloat(String(s || '0').replace(/,/g, '')) || 0
+  const norm = text.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ')
+  const skuRe = /\b([A-Z]\d{2,3}-\d{3,4})\b/g
+  const seen = new Set()
+  let m
+  while ((m = skuRe.exec(norm)) !== null) {
+    if (seen.has(m[1])) continue
+    seen.add(m[1])
+    const seg = norm.slice(m.index, m.index + 200)
+    // qty then unit price then total (USD format: 14,949.49)
+    const numM = seg.match(/(\d+)\s+(\d{1,3}(?:,\d{3})*\.\d{2})\s+(\d{1,3}(?:,\d{3})*\.\d{2})/)
+    if (numM) {
+      const qty = parseInt(numM[1])
+      const totalUSD = toUSD(numM[3]) || toUSD(numM[2]) * qty
+      if (qty > 0 && totalUSD > 0) items.push({ produto: m[1], qty, totalUSD })
     }
   }
-
-  const itensSheetName = wb.SheetNames.find(n =>
-    n.toLowerCase() === 'itens' || n.toLowerCase().includes('item')
-  )
-  const itensSheet = itensSheetName ? wb.Sheets[itensSheetName] : null
-
-  if (itensSheet) {
-    const rows = XLSX.utils.sheet_to_json(itensSheet, { header: 1, defval: null })
-    let headerIdx = -1
-    let ncmCol = 10, fobCol = 13, freteCol = 14, segCol = 15, qtyCol = 18, prodCol = 3, denomCol = 5
-
-    // auto-detectar colunas pelo cabeçalho
-    for (let i = 0; i < Math.min(5, rows.length); i++) {
-      const row = rows[i]
-      if (!row) continue
-      const upper = row.map(v => String(v || '').toUpperCase())
-      if (upper.some(v => v === 'NCM') && upper.some(v => v === 'FOB')) {
-        headerIdx = i
-        ncmCol    = upper.indexOf('NCM')
-        fobCol    = upper.indexOf('FOB')
-        freteCol  = upper.indexOf('FRETE')
-        segCol    = upper.indexOf('SEGURO')
-        prodCol   = upper.indexOf('PRODUTO')
-        denomCol  = upper.findIndex(v => v.startsWith('DENOM'))
-        qtyCol    = upper.findIndex(v => ['QUANTIDADE','QTDE','QTD','QUANT'].includes(v))
-        break
-      }
-    }
-
-    const startRow = headerIdx >= 0 ? headerIdx + 1 : 1
-    for (let i = startRow; i < rows.length; i++) {
-      const row = rows[i]
-      if (!row || row.every(v => v === null)) continue
-      const fobBRL   = parseFloat(row[fobCol])   || 0
-      const freteBRL = parseFloat(row[freteCol])  || 0
-      const segBRL   = parseFloat(row[segCol])    || 0
-      const ncm      = String(row[ncmCol] || '').replace(/\./g, '').trim()
-      const produto  = String(row[prodCol]  || '').trim()
-      const descr    = String(row[denomCol >= 0 ? denomCol : prodCol] || '').trim()
-      const qty      = parseFloat(row[qtyCol])    || 1
-
-      if (!ncm && !produto && fobBRL === 0) continue
-      items.push({
-        produto, descricao: descr, ncm,
-        fobBRL, freteBRL, seguroBRL: segBRL,
-        cifBRL: fobBRL + freteBRL + segBRL,
-        qty,
-      })
-    }
-  }
-
-  return { items, taxa }
+  return { items }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +260,34 @@ function generateXlsx(data) {
   const custoTotalCalc = itens
     ? itens.reduce((s, it) => s + brl(it.custoTotal), 0)
     : brl(d.cifBRL) + tributosDI + despTotal
+
+  // ── Cálculo por Item — gerado automaticamente da DUIMP ───────────────────
+  if (itens && itens.length > 0) {
+    const taxasSheet = [
+      ['MOEDA', 'TAXA', 'DATA'],
+      ['USD', brl(d.taxa), d.embarque || ''],
+    ]
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(taxasSheet), 'taxas')
+
+    const itensHeader = [
+      'NR DUIMP', 'DATA DUIMP', 'EXPORTADOR', 'PRODUTO', null,
+      'DENOMINAÇÃO', null, null, null, null,
+      'NCM', null, null,
+      'FOB R$', 'FRETE R$', 'SEGURO R$', null, null,
+      'QUANTIDADE', 'UNIDADE',
+    ]
+    const itensRows = [itensHeader]
+    itens.forEach(it => {
+      itensRows.push([
+        d.duimp || '', d.embarque || '', '', it.produto, null,
+        it.descricao || it.produto, null, null, null, null,
+        it.ncm, null, null,
+        brl(it.fobBRL), brl(it.freteBRL), brl(it.seguroBRL), null, null,
+        it.qty, 'UNIDADE',
+      ])
+    })
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(itensRows), 'Itens')
+  }
 
   // ── Resumo ───────────────────────────────────────────────────────────────
   const resumo = [
@@ -417,19 +473,16 @@ function generateXlsx(data) {
 // DOCUMENT TYPES
 // ─────────────────────────────────────────────────────────────────────────────
 const DOC_TYPES = [
-  { key: 'duimp',     label: 'DUIMP Desembaraçada',    hint: 'RB11879 - DUIMP DESEMBARAÇADA.pdf',  required: true,  ext: '.pdf',  color: '#7C3AED', bg: '#f5f3ff' },
-  { key: 'nota_fech', label: 'Nota de Fechamento',      hint: 'RB11879 - NOTA DE FECHAMENTO.PDF',   required: true,  ext: '.pdf',  color: '#0170B9', bg: '#eff6ff' },
-  { key: 'invoice',   label: 'Invoice (Fatura)',         hint: 'RB11879 - INVOICE.PDF',             required: false, ext: '.pdf',  color: '#D97706', bg: '#fffbeb' },
-  { key: 'calc',      label: 'Cálculo por Item (.xlsx)', hint: 'RB11879 - CÁLCULO POR ITEM.xlsx',   required: false, ext: '.xlsx', color: '#EA580C', bg: '#fff7ed' },
+  { key: 'duimp',     label: 'DUIMP Desembaraçada', hint: 'RB11879 - DUIMP DESEMBARAÇADA.pdf', required: true,  ext: '.pdf', color: '#7C3AED', bg: '#f5f3ff' },
+  { key: 'nota_fech', label: 'Nota de Fechamento',   hint: 'RB11879 - NOTA DE FECHAMENTO.PDF',  required: true,  ext: '.pdf', color: '#0170B9', bg: '#eff6ff' },
+  { key: 'invoice',   label: 'Invoice (Fatura)',      hint: 'RB11879 - INVOICE.PDF',            required: false, ext: '.pdf', color: '#D97706', bg: '#fffbeb' },
 ]
 
 function detectDocType(filename) {
   const f = filename.toLowerCase()
   if (f.includes('duimp') || f.includes('desembaraç') || f.includes('desembaraca')) return 'duimp'
   if (f.includes('fechamento')) return 'nota_fech'
-  if (f.includes('invoice')) return 'invoice'
-  if (f.includes('calculo') || f.includes('cálculo') || (f.endsWith('.xlsx') && f.includes('item'))) return 'calc'
-  if (f.endsWith('.xlsx')) return 'calc'
+  if (f.includes('invoice') || f.includes('fatura')) return 'invoice'
   return null
 }
 
@@ -461,26 +514,53 @@ export default function Importacao() {
     const errs = {}
     const result = { duimp: {}, notaFech: {}, itens: null }
 
-    const tryPdf = async (key, parser, targetKey) => {
-      if (!files[key]) return
+    let duimpText = null
+    if (files.duimp) {
       try {
-        const text = await extractPdfText(files[key])
-        result[targetKey || key] = parser(text)
-      } catch (e) { errs[key] = 'Erro ao ler PDF: ' + e.message }
+        duimpText = await extractPdfText(files.duimp)
+        result.duimp = parseDuimp(duimpText)
+      } catch (e) { errs.duimp = 'Erro ao ler PDF: ' + e.message }
     }
 
-    await tryPdf('duimp',     parseDuimp,         'duimp')
-    await tryPdf('nota_fech', parseNotaFechamento, 'notaFech')
-
-    if (files.calc) {
+    if (files.nota_fech) {
       try {
-        const buf = await files.calc.arrayBuffer()
-        const { items, taxa } = parseCalcXlsx(buf)
-        if (items.length > 0) {
-          if (taxa && !result.duimp.taxa) result.duimp.taxa = taxa
-          result.itens = computeRateio(items, result.notaFech)
+        const text = await extractPdfText(files.nota_fech)
+        result.notaFech = parseNotaFechamento(text)
+      } catch (e) { errs.nota_fech = 'Erro ao ler PDF: ' + e.message }
+    }
+
+    // Extrai itens da DUIMP (adições) — gera o Cálculo por Item automaticamente
+    let items = []
+    if (duimpText) {
+      items = parseDuimpItens(duimpText)
+    }
+
+    // Fallback: Invoice como fonte de itens + rateio proporcional FOB
+    if (items.length === 0 && files.invoice) {
+      try {
+        const invText = await extractPdfText(files.invoice)
+        const { items: invItems } = parseInvoice(invText)
+        if (invItems.length > 0 && result.duimp.taxa > 0) {
+          const totalFobBRL = invItems.reduce((s, it) => s + it.totalUSD * result.duimp.taxa, 0)
+          const totFrete  = result.duimp.freteBRL  || 0
+          const totSeguro = result.duimp.seguroBRL || 0
+          items = invItems.map((it, idx) => {
+            const fobBRL   = it.totalUSD * result.duimp.taxa
+            const ratio    = totalFobBRL > 0 ? fobBRL / totalFobBRL : 1 / invItems.length
+            const freteBRL = totFrete  * ratio
+            const seguroBRL = totSeguro * ratio
+            return {
+              seq: idx + 1, produto: it.produto, descricao: it.produto,
+              ncm: '90189099', qty: it.qty,
+              fobBRL, freteBRL, seguroBRL, cifBRL: fobBRL + freteBRL + seguroBRL,
+            }
+          })
         }
-      } catch (e) { errs.calc = e.message }
+      } catch (_) { /* Invoice é best-effort */ }
+    }
+
+    if (items.length > 0) {
+      result.itens = computeRateio(items, result.notaFech)
     }
 
     setErrors(errs)
@@ -499,7 +579,7 @@ export default function Importacao() {
         badge="Importação & Aduana"
         icon="🚢"
         title="Upload Inteligente de Documentos"
-        subtitle="Arraste os documentos · o sistema extrai, rateia por item e gera a planilha preenchida"
+        subtitle="Arraste DUIMP + Nota de Fechamento · o sistema extrai adições, rateia tributos por item e gera a planilha completa"
         kpis={[
           { label: 'Docs carregados', value: String(fileCount), sub: `${DOC_TYPES.filter(d => d.required).length} obrigatórios` },
           { label: 'Status', value: requiredDone ? 'Pronto' : 'Aguardando', sub: requiredDone ? '✓ ok' : 'faltam docs' },
@@ -645,11 +725,11 @@ function UploadTab({ files, errors, parsing, dragging, requiredDone, onDrop, onD
             Como usar
           </div>
           {[
-            { step: '1', text: 'Arraste todos os documentos do processo (PDF + XLSX)' },
+            { step: '1', text: 'Arraste a DUIMP Desembaraçada e a Nota de Fechamento (obrigatórios) · Invoice opcional' },
             { step: '2', text: 'O sistema detecta o tipo automaticamente pelo nome do arquivo' },
-            { step: '3', text: '"Extrair & Calcular" — lê PDFs e executa o rateio de tributos por item' },
-            { step: '4', text: 'Revise a aba "Rateio por Item": CIF, tributos e custo unitário por produto' },
-            { step: '5', text: '"Gerar Planilha" baixa o xlsx com Resumo, DI Geral, Contab. e NCM' },
+            { step: '3', text: '"Extrair & Calcular" — lê os PDFs e extrai adições/itens diretamente da DUIMP' },
+            { step: '4', text: 'Revise o "Rateio por Item": CIF, tributos e custo unitário gerados automaticamente' },
+            { step: '5', text: '"Gerar Planilha" baixa o xlsx com Cálculo por Item + Resumo + DI Geral + NF Entrada + Contab. + NCM' },
           ].map(({ step, text }) => (
             <div key={step} style={{ display: 'flex', gap: 10, marginBottom: 10, alignItems: 'flex-start' }}>
               <div style={{
@@ -925,6 +1005,10 @@ function ExportTab({ data, onExport }) {
 
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 28, textAlign: 'left' }}>
           {[
+            ...(itens ? [
+              { tab: 'taxas',          desc: 'Taxa de câmbio USD/BRL extraída da DUIMP', icon: '💱', highlight2: true },
+              { tab: 'Itens',          desc: `${itens.length} itens com FOB, Frete e Seguro alocados (gerado da DUIMP)`, icon: '📦', highlight2: true },
+            ] : []),
             { tab: 'Resumo',    desc: 'Composição + Acerto ROTA (DI vs A PG vs Ajustes)', icon: '📊' },
             { tab: 'DI Geral',  desc: `${itens ? `${itens.length} linhas por item` : 'Totais consolidados'} · tributos e custo unit.`, icon: '🧮' },
             { tab: 'NF Entrada',desc: 'Valores calculados prontos para emitir a NF de entrada', icon: '🧾', highlight: true },
@@ -933,11 +1017,13 @@ function ExportTab({ data, onExport }) {
           ].map(item => (
             <div key={item.tab} style={{
               padding: '12px 14px', borderRadius: 10,
-              background: item.highlight ? '#f0fdf4' : C.gray,
-              border: `1px solid ${item.highlight ? '#86efac' : C.gray2}`,
+              background: item.highlight ? '#f0fdf4' : item.highlight2 ? '#eff6ff' : C.gray,
+              border: `1px solid ${item.highlight ? '#86efac' : item.highlight2 ? '#bfdbfe' : C.gray2}`,
             }}>
-              <div style={{ fontSize: 13, marginBottom: 4 }}>{item.icon} <strong style={{ color: item.highlight ? '#166534' : 'inherit' }}>{item.tab}</strong></div>
-              <div style={{ fontSize: 11, color: item.highlight ? '#166534' : C.gray4 }}>{item.desc}</div>
+              <div style={{ fontSize: 13, marginBottom: 4 }}>
+                {item.icon} <strong style={{ color: item.highlight ? '#166534' : item.highlight2 ? '#1e40af' : 'inherit' }}>{item.tab}</strong>
+              </div>
+              <div style={{ fontSize: 11, color: item.highlight ? '#166534' : item.highlight2 ? '#1e40af' : C.gray4 }}>{item.desc}</div>
             </div>
           ))}
         </div>
@@ -953,11 +1039,13 @@ function ExportTab({ data, onExport }) {
           Baixar Planilha_Importacao_{d?.nRef || 'output'}.xlsx
         </button>
 
-        <div style={{ marginTop: 16, padding: '12px 16px', borderRadius: 10, background: '#f0fdf4', border: '1px solid #86efac', textAlign: 'left' }}>
-          <Info size={11} style={{ display: 'inline', marginRight: 4, color: '#166534' }} />
-          <span style={{ fontSize: 11, color: '#166534' }}>
-            A aba <strong>"NF Entrada"</strong> contém os valores calculados por item prontos para preencher a Nota Fiscal de entrada no sistema.
-            {!itens && <> Carregue o <strong>Cálculo por Item.xlsx</strong> para obter o custo unitário por produto.</>}
+        <div style={{ marginTop: 16, padding: '12px 16px', borderRadius: 10, background: '#eff6ff', border: '1px solid #bfdbfe', textAlign: 'left' }}>
+          <Info size={11} style={{ display: 'inline', marginRight: 4, color: '#1e40af' }} />
+          <span style={{ fontSize: 11, color: '#1e40af' }}>
+            {itens
+              ? <>As abas <strong>taxas</strong> e <strong>Itens</strong> foram <strong>geradas automaticamente</strong> da DUIMP — equivalem ao "Cálculo por Item" com FOB, Frete e Seguro alocados por adição.</>
+              : <>Carregue a <strong>DUIMP</strong> e o <strong>Invoice</strong> para obter o cálculo por item automaticamente — nenhum xlsx manual necessário.</>
+            }
           </span>
         </div>
       </div>
