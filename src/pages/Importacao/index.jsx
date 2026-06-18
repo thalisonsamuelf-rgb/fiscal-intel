@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from 'react'
 import PageShell from '../../components/layout/PageShell'
 import PageHero from '../../components/layout/PageHero'
 import { gradients, C } from '../../theme/brand'
-import * as XLSX from 'xlsx'
+import { generateXlsx } from './xlsxGenerator'
 // Worker do pdf.js empacotado localmente pelo Vite (à prova de versão, sem dependência de CDN)
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import {
@@ -296,229 +296,8 @@ function parseInvoice(text) {
 // ─────────────────────────────────────────────────────────────────────────────
 // XLSX GENERATOR
 // ─────────────────────────────────────────────────────────────────────────────
-const brl = v => typeof v === 'number' ? v : 0
+// A geração da planilha (layout premium, exceljs) está em ./xlsxGenerator.js
 
-function generateXlsx(data) {
-  const { duimp: d, notaFech: nf, itens } = data
-  const wb = XLSX.utils.book_new()
-
-  const tributosDI = brl(d.ii) + brl(d.ipi) + brl(d.pis) + brl(d.cofins) + brl(d.tus)
-  const despTotal  = brl(nf.armazenagem) + brl(nf.dape) + brl(nf.freteRod) +
-                     brl(nf.dta) + brl(nf.lpco) + brl(nf.expediente) + brl(nf.tus)
-  const totalAPG   = tributosDI + despTotal + brl(nf.freteInt)
-  const ajustes    = brl(d.pis) + brl(d.cofins)
-  const totalDI    = totalAPG - ajustes
-  const custoTotalCalc = itens
-    ? itens.reduce((s, it) => s + brl(it.custoTotal), 0)
-    : brl(d.cifBRL) + tributosDI + despTotal
-
-  // ── Cálculo por Item — gerado automaticamente da DUIMP ───────────────────
-  if (itens && itens.length > 0) {
-    const taxasSheet = [
-      ['MOEDA', 'TAXA', 'DATA'],
-      ['USD', brl(d.taxa), d.embarque || ''],
-    ]
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(taxasSheet), 'taxas')
-
-    const itensHeader = [
-      'NR DUIMP', 'DATA DUIMP', 'EXPORTADOR', 'PRODUTO', null,
-      'DENOMINAÇÃO', null, null, null, null,
-      'NCM', null, null,
-      'FOB R$', 'FRETE R$', 'SEGURO R$', null, null,
-      'QUANTIDADE', 'UNIDADE',
-    ]
-    const itensRows = [itensHeader]
-    itens.forEach(it => {
-      itensRows.push([
-        d.duimp || '', d.embarque || '', '', it.produto, null,
-        it.descricao || it.produto, null, null, null, null,
-        it.ncm, null, null,
-        brl(it.fobBRL), brl(it.freteBRL), brl(it.seguroBRL), null, null,
-        it.qty, 'UNIDADE',
-      ])
-    })
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(itensRows), 'Itens')
-  }
-
-  // ── Resumo ───────────────────────────────────────────────────────────────
-  const resumo = [
-    [null, 'DESCRIÇÃO', 'VALOR DI', null, 'PAGAR ROTA', null, null, 'VAR. CAMBIAL', null, null, 'ACERTO ROTA'],
-    [null, null, null, null, null, null, null, null, null, null, null, 'DI', 'A PG', 'AJUSTES'],
-    [null, 'II', brl(d.ii), null, brl(d.ii), null, null, 0, null, null, 'IMPOSTOS', totalDI - despTotal - brl(nf.freteInt), totalAPG - despTotal - brl(nf.freteInt), ajustes],
-    [null, 'IPI', brl(d.ipi), null, brl(d.ipi), null, null, 0, null, null, 'DESPESAS', despTotal, despTotal, 0],
-    [null, 'PIS', 0, null, brl(d.pis), null, null, brl(d.pis), null, null, 'FRETE', brl(nf.freteInt), brl(nf.freteInt), 0],
-    [null, 'COFINS', 0, null, brl(d.cofins), null, null, brl(d.cofins), null, null, 'CAPATAZIA', brl(nf.expediente), brl(nf.expediente), 0],
-    [null, 'ICMS total', 0, null, null, 0, null, 0, null, null, 'TAXAS DO CE', 0, 0, 0],
-    [null, 'Taxa Siscomex', brl(d.tus), null, brl(d.tus), null, null, 0, null, null, 'SEGURO', brl(d.seguroBRL), 0, -brl(d.seguroBRL)],
-    [null, 'Outras despesas', despTotal, null, despTotal, null, null, 0, null, null, 'TOTAL', totalDI, totalAPG, ajustes],
-    [null, 'Armazenagem', brl(nf.armazenagem), null, brl(nf.armazenagem)],
-    [null, 'LPCO', brl(nf.lpco), null, brl(nf.lpco)],
-    [null, 'Frete Internacional', brl(nf.freteInt), null, brl(nf.freteInt)],
-    [null, 'Expediente Rota', brl(nf.expediente), null, brl(nf.expediente)],
-    [null, 'Seguro', brl(d.seguroBRL), null, 0],
-    [null, 'Invoice (FOB)', brl(d.fobBRL), null, brl(d.fobBRL), 0],
-    [null, 'TOTAL (custo calculado)', custoTotalCalc, null, totalAPG],
-    [null, 'NFs entrada', custoTotalCalc],
-    [null, 'TOTAL NFs', custoTotalCalc],
-    [null, 'Conferência', 0],
-  ]
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(resumo), 'Resumo')
-
-  // ── DI Geral ─────────────────────────────────────────────────────────────
-  const diRows = [
-    [null, null, null, null, null, 'DI', null, `${d.nRef || ''} - ${d.duimp || ''}`],
-    [null, null, null, null, null, 'Dolar americano', null, brl(d.taxa)],
-    [null, null, null, null, null, 'Data Chegada', null, d.embarque || ''],
-    [null, null, null, null, null, 'AWB', null, d.awb || ''],
-    [],
-    [null, 'Adição', 'SEQ', 'Produto', 'NCM', 'Descrição', 'Qtde',
-     'FOB R$', 'Frete R$', 'Seguro R$', 'CIF R$', '% CIF',
-     '% II', 'II R$', '% IPI', 'IPI R$', '% PIS', 'PIS R$',
-     '% COFINS', 'COFINS R$', 'ICMS R$', 'Desp. Aces. R$',
-     'CUSTO TOTAL R$', 'CUSTO UNIT. R$'],
-  ]
-
-  if (itens && itens.length > 0) {
-    itens.forEach((it, idx) => {
-      const rates = getNcmRates(it.ncm)
-      diRows.push([
-        null, it.adicao || 1, idx + 1, it.produto, it.ncm, it.descricao, it.qty,
-        brl(it.fobBRL), brl(it.freteBRL), brl(it.seguroBRL), brl(it.cifBRL), brl(it.ratio),
-        rates.ii, brl(it.ii), rates.ipi, brl(it.ipi),
-        rates.pisNorm * rates.pisRed, brl(it.pis),
-        rates.cofinsNorm * rates.cofinsRed, brl(it.cofins), brl(it.icms),
-        brl(it.desp), brl(it.custoTotal), brl(it.custoUnit),
-      ])
-    })
-    const totals = itens.reduce((acc, it) => ({
-      fob: acc.fob + brl(it.fobBRL), frete: acc.frete + brl(it.freteBRL),
-      seg: acc.seg + brl(it.seguroBRL), cif: acc.cif + brl(it.cifBRL),
-      ii: acc.ii + brl(it.ii), ipi: acc.ipi + brl(it.ipi),
-      pis: acc.pis + brl(it.pis), cofins: acc.cofins + brl(it.cofins),
-      desp: acc.desp + brl(it.desp), ct: acc.ct + brl(it.custoTotal),
-    }), { fob: 0, frete: 0, seg: 0, cif: 0, ii: 0, ipi: 0, pis: 0, cofins: 0, desp: 0, ct: 0 })
-    diRows.push([
-      null, null, null, 'TOTAL', null, null, null,
-      totals.fob, totals.frete, totals.seg, totals.cif, 1,
-      null, totals.ii, null, totals.ipi, null, totals.pis, null, totals.cofins, 0,
-      totals.desp, totals.ct, null,
-    ])
-  } else {
-    diRows.push([
-      null, null, null, 'TOTAL PROCESSO', null, null, null,
-      brl(d.fobBRL), brl(d.freteBRL), brl(d.seguroBRL), brl(d.cifBRL), 1,
-      null, brl(d.ii), null, brl(d.ipi), null, brl(d.pis), null, brl(d.cofins), 0,
-      despTotal, custoTotalCalc, null,
-    ])
-  }
-
-  diRows.push(
-    [],
-    [null, null, null, null, null, 'DESPESAS ACESSÓRIAS', null, null, null, null, null, null, 'VALOR'],
-    [null, null, null, null, null, 'Taxa Siscomex (TUS)',   null, null, null, null, null, null, brl(d.tus)],
-    [null, null, null, null, null, 'Armazenagem',           null, null, null, null, null, null, brl(nf.armazenagem)],
-    [null, null, null, null, null, 'LPCO ANVISA',           null, null, null, null, null, null, brl(nf.lpco)],
-    [null, null, null, null, null, 'DAPE Carregamento',     null, null, null, null, null, null, brl(nf.dape)],
-    [null, null, null, null, null, 'Frete Rodoviário',      null, null, null, null, null, null, brl(nf.freteRod)],
-    [null, null, null, null, null, 'DTA',                   null, null, null, null, null, null, brl(nf.dta)],
-    [null, null, null, null, null, 'Expediente Rota',       null, null, null, null, null, null, brl(nf.expediente)],
-    [null, null, null, null, null, 'TOTAL DESPESAS',        null, null, null, null, null, null, despTotal],
-    [],
-    [null, null, null, null, null, 'Frete Internacional',   null, null, null, null, null, null, brl(nf.freteInt)],
-    [null, null, null, null, null, 'Saldo a favor',         null, null, null, null, null, null, brl(nf.saldoFavor)],
-  )
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(diRows), 'DI Geral')
-
-  // ── Contab. ───────────────────────────────────────────────────────────────
-  const ratesRef = NCM_RATES['90189099']
-  const cofinsCredito = brl(d.cofins) / ratesRef.cofinsRed
-  const pisCredito    = brl(d.pis)    / ratesRef.pisRed
-  const equipamentos  = custoTotalCalc - brl(d.ipi)
-
-  const contab = [
-    [null, 'NF', 'Data', 'Conta contábil', 'Descrição', 'Moeda', 'Valor USD', 'D/C', 'Valor R$'],
-    [null, '(a emitir)', '', '1.1.03.07.0007', 'COFINS Não Cumulativo Importação', null, null, 'D', cofinsCredito],
-    [null, null, null, '1.1.03.07.0007', 'PIS Não Cumulativo Importação', null, null, 'D', pisCredito],
-    [null, null, null, null, 'IPI', null, null, 'D', brl(d.ipi)],
-    [null, null, null, null, 'ICMS a Recuperar', null, null, 'D', 0],
-    [null, null, null, null, 'Equipamentos / Mercadorias', null, null, 'D', equipamentos],
-    [null, null, null, null, 'Fornecedor Exterior (Invoice)', null, brl(d.fobUSD), 'C', -brl(d.fobBRL)],
-    [null, null, null, null, 'Rota Brazil (Contas a Pagar)', null, null, 'C', -totalAPG],
-    [null, null, null, '3.2.04.01.0003', 'Variação Cambial Passiva Realizada', null, null, null, brl(d.pis) + brl(d.cofins)],
-  ]
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(contab), 'Contab.')
-
-  // ── NCM ───────────────────────────────────────────────────────────────────
-  const ncmRows = [
-    [null, 'NCM', 'II', 'IPI', 'PIS normal', 'PIS red.', 'PIS efetiva', 'COFINS normal', 'COFINS red.', 'COFINS efetiva', 'ICMS', 'Observação'],
-  ]
-  const ncmsUsados = [...new Set((itens || []).map(it => it.ncm).filter(Boolean))]
-  if (ncmsUsados.length === 0) ncmsUsados.push('90189099')
-  for (const ncm of ncmsUsados) {
-    const r = getNcmRates(ncm)
-    ncmRows.push([
-      null, ncm, r.ii, r.ipi,
-      r.pisNorm, r.pisRed, r.pisNorm * r.pisRed,
-      r.cofinsNorm, r.cofinsRed, r.cofinsNorm * r.cofinsRed,
-      r.icms, 'Dispositivo médico — redução PIS/COFINS por convênio CAMEX',
-    ])
-  }
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ncmRows), 'NCM')
-
-  // ── NF Entrada — valores calculados para emissão da NF de entrada ─────────
-  // Esta aba contém os dados prontos para preencher a Nota Fiscal de entrada
-  const nfRows = [
-    [null, 'NF ENTRADA — DADOS CALCULADOS', null, null, null, null],
-    [null, 'Processo', `${d.nRef || ''} — DUIMP ${d.duimp || ''}`],
-    [null, 'Taxa câmbio', brl(d.taxa), null, 'Data DUIMP', d.embarque || ''],
-    [],
-    [null, 'CFOP', '3.101', null, '(Compra para industrialização / uso/consumo — importação)'],
-    [],
-    // Cabeçalho da tabela de itens
-    [null, 'Produto / SKU', 'Descrição', 'NCM', 'Qtde', 'Un',
-     'Vlr Unit. R$', 'Vlr Total R$', 'IPI R$', 'BC PIS R$', 'PIS R$', 'BC COFINS R$', 'COFINS R$', 'BC ICMS R$', 'ICMS R$'],
-  ]
-
-  if (itens && itens.length > 0) {
-    itens.forEach(it => {
-      nfRows.push([
-        null, it.produto, it.descricao, it.ncm, it.qty, 'UN',
-        brl(it.custoUnit), brl(it.custoTotal),
-        brl(it.ipi),
-        brl(it.cifBRL), brl(it.pis),   // BC PIS = CIF, PIS = valor já reduzido
-        brl(it.cifBRL), brl(it.cofins), // BC COFINS = CIF
-        0, 0,                            // ICMS = zerado
-      ])
-    })
-    nfRows.push(
-      [],
-      [null, null, null, null, null, null, null, 'TOTAL PRODUTOS', null, null, null, null, null, null, null],
-      [null, null, null, null, null, null, null, custoTotalCalc, brl(d.ipi), null, brl(d.pis), null, brl(d.cofins), 0, 0],
-    )
-  } else {
-    nfRows.push([
-      null, 'PROCESSO CONSOLIDADO', '', '', null, null,
-      null, custoTotalCalc, brl(d.ipi), brl(d.cifBRL), brl(d.pis), brl(d.cifBRL), brl(d.cofins), 0, 0,
-    ])
-  }
-
-  nfRows.push(
-    [],
-    [null, 'TOTAIS DA NF'],
-    [null, 'Valor Total dos Produtos', custoTotalCalc - brl(d.ipi)],
-    [null, 'Valor do IPI', brl(d.ipi)],
-    [null, 'Outras Despesas Acessórias', 0, null, '(já incorporadas ao custo dos produtos)'],
-    [null, 'VALOR TOTAL DA NF', custoTotalCalc],
-    [],
-    [null, 'CRÉDITOS FISCAIS (lançar separado)'],
-    [null, 'PIS a recuperar (crédito)', brl(d.pis) / (NCM_RATES['90189099'].pisRed), null, 'Valor cheio antes da redução'],
-    [null, 'COFINS a recuperar (crédito)', brl(d.cofins) / (NCM_RATES['90189099'].cofinsRed), null, 'Valor cheio antes da redução'],
-    [null, 'IPI a recuperar (se aplicável)', brl(d.ipi)],
-  )
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(nfRows), 'NF Entrada')
-
-  XLSX.writeFile(wb, `Planilha_Importacao_${d.nRef || 'output'}.xlsx`)
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DOCUMENT TYPES
@@ -681,7 +460,7 @@ export default function Importacao() {
         )}
         {tab === 'resumo' && extracted && <ResumoTab data={extracted} />}
         {tab === 'rateio' && extracted?.itens && <RateioTab data={extracted} />}
-        {tab === 'export' && extracted && <ExportTab data={extracted} onExport={() => generateXlsx(extracted)} />}
+        {tab === 'export' && extracted && <ExportTab data={extracted} onExport={() => { generateXlsx(extracted).catch(e => alert('Erro ao gerar planilha: ' + e.message)) }} />}
       </div>
     </PageShell>
   )
