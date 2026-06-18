@@ -3,6 +3,8 @@ import PageShell from '../../components/layout/PageShell'
 import PageHero from '../../components/layout/PageHero'
 import { gradients, C } from '../../theme/brand'
 import * as XLSX from 'xlsx'
+// Worker do pdf.js empacotado localmente pelo Vite (à prova de versão, sem dependência de CDN)
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import {
   Upload, FileSpreadsheet, CheckCircle, Loader2,
   Download, Zap, X, AlertTriangle, RotateCcw, Info,
@@ -70,8 +72,7 @@ let _pdfjs = null
 async function getPdfJs() {
   if (_pdfjs) return _pdfjs
   _pdfjs = await import('pdfjs-dist')
-  _pdfjs.GlobalWorkerOptions.workerSrc =
-    `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${_pdfjs.version}/pdf.worker.min.js`
+  _pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
   return _pdfjs
 }
 
@@ -100,7 +101,7 @@ function parseDuimp(text) {
     nRef:      g(/N\/REF[.\s]*:\s*(\S+)/),
     duimp:     g(/Extrato da D(?:uimp|UIMP)\s+([\w-]+)/i) || g(/26BR[\w-]+/),
     awb:       g(/BL\s*\/\s*AWB\s*HOUSE[.\s]*:\s*(\d+)/),
-    taxa:      parseFloat(g(/TAXA[.\s]*:\s*\d+\s+DOLAR[^0-9]+([\d.]+)/)) || 0,
+    taxa:      toBRL(g(/TAXA[.\s]*:\s*\d+\s+DOLAR[^0-9]+([\d.,]+)/)),
     embarque:  g(/EMISS[ÃA]O\s+CONHECIMENTO[.\s]*:\s*([\d/]+)/),
     fobBRL:    n(/TOTAL\s+FOB[.\s]*:\s*R\$\s*([\d,.]+)/),
     fobUSD:    n(/TOTAL\s+FOB[.\s]*:.*?USD\s*([\d,.]+)/),
@@ -119,22 +120,35 @@ function parseDuimp(text) {
 }
 
 function parseNotaFechamento(text) {
-  const n = p => { const m = text.match(p); return m ? toBRL(m[1]) : 0 }
-  const lineVal = keyword => {
-    const re = new RegExp(keyword + '[^\\d]+((?:[\\d]+[.,]){1,}[\\d]{2})', 'i')
-    return n(re)
+  // Layout (Rota Brazil): tabela LABEL · FORNECEDOR · DATA · CRÉDITO · DÉBITO.
+  // A coluna de DATA fica entre o rótulo e o valor — por isso o valor não é o
+  // "primeiro número": é o maior valor monetário (vírgula decimal) da linha
+  // (o crédito costuma ser 0,00 e o débito é o valor cobrado).
+  const norm = text.replace(/\s+/g, ' ')
+  const moneyRe = /\d{1,3}(?:\.\d{3})*,\d{2}/g
+  const debito = (label, win = 75) => {
+    const i = norm.search(new RegExp(label, 'i'))
+    if (i < 0) return 0
+    const nums = (norm.slice(i, i + label.length + win).match(moneyRe) || []).map(toBRL)
+    return nums.length ? Math.max(...nums) : 0
   }
   return {
-    freteInt:     lineVal('FRETE INTERNACIONAL'),
-    lpco:         lineVal('LPCO'),
-    armazenagem:  lineVal('ARMAZENAGEM'),
-    dape:         lineVal('DAPE'),
-    freteRod:     lineVal('FRETE RODOVI'),
-    dta:          n(/\bDTA\b[^\d]+([\d,.]+)/),
-    expediente:   lineVal('EXPEDIENTE'),
-    tus:          lineVal('SISCOMEX'),
-    adiantamento: n(/ADIANTAMENTO[^\d]+([\d,.]+)/),
-    saldoFavor:   n(/TOTAL A FAVOR[^\d]+([\d,.]+)/),
+    freteInt:     debito('FRETE INTERNACIONAL'),
+    lpco:         debito('LPCO'),
+    armazenagem:  debito('ARMAZENAGEM'),
+    dape:         debito('DAPE'),
+    freteRod:     debito('FRETE RODOVI'),
+    dta:          debito('DTA ROTA'),
+    // EXPEDIENTE fica na seção SERVIÇOS (sem coluna de data): pega o débito da
+    // própria linha (crédito 0,00 + débito) — janela curta evita vazar p/ TOTAIS.
+    expediente:   (() => {
+      const m = norm.match(/EXPEDIENTE[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})\s+(\d{1,3}(?:\.\d{3})*,\d{2})/i)
+      return m ? Math.max(toBRL(m[1]), toBRL(m[2])) : 0
+    })(),
+    tus:          debito('SISCOMEX'),
+    // Adiantamento: o valor está na coluna CRÉDITO (1º monetário após a data)
+    adiantamento: toBRL((norm.match(/ADIANTAMENTO[^\d]*\d{2}\/\d{2}\/\d{4}\s*(\d{1,3}(?:\.\d{3})*,\d{2})/i) || [])[1] || '0'),
+    saldoFavor:   toBRL((norm.match(/TOTAL A FAVOR[^\d]+(\d{1,3}(?:\.\d{3})*,\d{2})/i) || [])[1] || '0'),
   }
 }
 
@@ -142,7 +156,8 @@ function parseNotaFechamento(text) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PARSER — Itens da DUIMP (extrai adições/itens do PDF da DUIMP desembaraçada)
-// Estratégia 1: split por marcador "ITEM N°/Nº"
+// Estratégia 0: blocos de "Mercadoria" do Extrato (Portal Único) — valores em USD
+// Estratégia 1: split por marcador "ITEM N°/Nº" (layouts antigos)
 // Estratégia 2: âncoras por código de produto (M30-013)
 // ─────────────────────────────────────────────────────────────────────────────
 function parseDuimpItens(text) {
@@ -150,9 +165,45 @@ function parseDuimpItens(text) {
   const norm = text.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ')
   let found = []
 
+  // ── Estratégia 0 — Extrato DUIMP (Portal Único) ─────────────────────────────
+  // Cada item é uma "Mercadoria" da adição. O valor por item vem em USD
+  // ("Valor total na condição de venda"); FOB R$ = USD × taxa, e Frete/Seguro
+  // são rateados proporcionalmente ao FOB (usando os totais da DUIMP). Confere
+  // com o "TOTAL FOB" / "VALOR ADUANEIRO" do extrato.
+  {
+    const taxa   = toBRL((text.match(/TAXA[.\s]*:\s*\d+\s+DOLAR[^0-9]+([\d.,]+)/) || [])[1] || '0')
+    const freteT = toBRL((text.match(/TOTAL\s+FRETE[.\s]*:\s*R\$\s*([\d,.]+)/) || [])[1] || '0')
+    const segT   = toBRL((text.match(/TOTAL\s+SEGURO[.\s]*:\s*R\$\s*([\d,.]+)/) || [])[1] || '0')
+    const ncmHits = [...norm.matchAll(/NCM:?\s*(\d{4})\.?(\d{2})\.?(\d{2})/gi)].map(m => ({ i: m.index, ncm: m[1] + m[2] + m[3] }))
+    const ncmFor = pos => { let best = '90189099'; for (const h of ncmHits) if (h.i <= pos) best = h.ncm; return best }
+    const re0 = /Quantidade na unidade comercializada:\s*([\d.,]+)[\s\S]*?Valor total na condi[çc][ãa]o de venda:\s*([\d.,]+)[\s\S]*?Detalhamento do Produto:\s*([\s\S]{0,160})/gi
+    const blocks = []
+    let m0
+    while ((m0 = re0.exec(norm)) !== null) {
+      const skuM = m0[3].match(/[A-Z]\d{2,3}-\d{3,4}/)
+      blocks.push({
+        qty: n2(m0[1]), totalUSD: n2(m0[2]), pos: m0.index,
+        produto: skuM ? skuM[0] : m0[3].trim().split(' ').slice(0, 2).join(' '),
+      })
+    }
+    if (blocks.length > 0 && taxa > 0) {
+      const totUSD = blocks.reduce((s, b) => s + b.totalUSD, 0)
+      found = blocks.map((b, idx) => {
+        const fobBRL    = b.totalUSD * taxa
+        const ratio     = totUSD > 0 ? b.totalUSD / totUSD : 1 / blocks.length
+        const freteBRL  = freteT * ratio
+        const seguroBRL = segT * ratio
+        return {
+          seq: idx + 1, produto: b.produto, descricao: b.produto, ncm: ncmFor(b.pos),
+          qty: b.qty, fobBRL, freteBRL, seguroBRL, cifBRL: fobBRL + freteBRL + seguroBRL,
+        }
+      })
+    }
+  }
+
   // Estratégia 1 — split por "ITEM N° 001"
   const splits = norm.split(/ITEM\s+N[°º]?\s*\.?\s*0*(\d+)/i)
-  if (splits.length > 1) {
+  if (found.length === 0 && splits.length > 1) {
     for (let i = 1; i < splits.length; i += 2) {
       const seq = parseInt(splits[i]) || Math.ceil(i / 2)
       const seg = splits[i + 1] || ''
